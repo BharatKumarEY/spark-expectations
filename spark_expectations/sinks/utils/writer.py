@@ -12,6 +12,7 @@ from pyspark.sql.functions import (
     create_map,
     explode,
     to_json,
+    col,
 )
 from spark_expectations import _log
 from spark_expectations.core.exceptions import (
@@ -58,7 +59,7 @@ class SparkExpectationsWriter:
                 df = df.withColumn(
                     self._context.get_run_id_name, lit(f"{self._context.get_run_id}")
                 ).withColumn(
-                    self._context.get_run_date_name,
+                    self._context.get_run_date_time_name,
                     to_timestamp(
                         lit(f"{self._context.get_run_date}"), "yyyy-MM-dd HH:mm:ss"
                     ),
@@ -83,14 +84,36 @@ class SparkExpectationsWriter:
             if config["options"] is not None and config["options"] != {}:
                 _df_writer = _df_writer.options(**config["options"])
 
+            _log.info("Writing records to table: %s", table_name)
+
             if config["format"] == "bigquery":
                 _df_writer.option("table", table_name).save()
             else:
                 _df_writer.saveAsTable(name=table_name)
-                self.spark.sql(
-                    f"ALTER TABLE {table_name} SET TBLPROPERTIES ('product_id' = '{self._context.product_id}')"
-                )
-            _log.info("finished writing records to table: %s,", table_name)
+                _log.info("finished writing records to table: %s,", table_name)
+                if not stats_table:
+                    # Fetch table properties
+                    table_properties = self.spark.sql(
+                        f"SHOW TBLPROPERTIES {table_name}"
+                    ).collect()
+                    table_properties_dict = {
+                        row["key"]: row["value"] for row in table_properties
+                    }
+
+                    # Set product_id in table properties
+                    if (
+                        table_properties_dict.get("product_id") is None
+                        or table_properties_dict.get("product_id")
+                        != self._context.product_id
+                    ):
+                        _log.info(
+                            "product_id is not set for table %s in tableproperties, setting it now",
+                            table_name,
+                        )
+                        self.spark.sql(
+                            f"ALTER TABLE {table_name} SET TBLPROPERTIES ('product_id' = "
+                            f"'{self._context.product_id}')"
+                        )
 
         except Exception as e:
             raise SparkExpectationsUserInputOrConfigInvalidException(
@@ -139,19 +162,27 @@ class SparkExpectationsWriter:
                     self._context.get_output_percentage,
                     self._context.get_success_percentage,
                     self._context.get_error_percentage,
-                    source_agg_dq_result
-                    if source_agg_dq_result and len(source_agg_dq_result) > 0
-                    else None,
-                    final_agg_dq_result
-                    if final_agg_dq_result and len(final_agg_dq_result) > 0
-                    else None,
-                    source_query_dq_result
-                    if source_query_dq_result and len(source_query_dq_result) > 0
-                    else None,
-                    final_query_dq_result
-                    if final_query_dq_result and len(final_query_dq_result) > 0
-                    else None,
-                    self._context.get_summarised_row_dq_res,
+                    (
+                        source_agg_dq_result
+                        if source_agg_dq_result and len(source_agg_dq_result) > 0
+                        else None
+                    ),
+                    (
+                        final_agg_dq_result
+                        if final_agg_dq_result and len(final_agg_dq_result) > 0
+                        else None
+                    ),
+                    (
+                        source_query_dq_result
+                        if source_query_dq_result and len(source_query_dq_result) > 0
+                        else None
+                    ),
+                    (
+                        final_query_dq_result
+                        if final_query_dq_result and len(final_query_dq_result) > 0
+                        else None
+                    ),
+                    self._context.get_summarized_row_dq_res,
                     self._context.get_rules_exceeds_threshold,
                     {
                         "run_status": self._context.get_dq_run_status,
@@ -185,7 +216,6 @@ class SparkExpectationsWriter:
                     ),
                 )
             ]
-            error_stats_rdd = self.spark.sparkContext.parallelize(error_stats_data)
 
             from pyspark.sql.types import (
                 StructType,
@@ -257,7 +287,7 @@ class SparkExpectationsWriter:
                 ]
             )
 
-            df = self.spark.createDataFrame(error_stats_rdd, schema=error_stats_schema)
+            df = self.spark.createDataFrame(error_stats_data, schema=error_stats_schema)
             self._context.print_dataframe_with_debugger(df)
 
             df = (
@@ -381,22 +411,26 @@ class SparkExpectationsWriter:
                     self._context.get_run_id_name, lit(self._context.get_run_id)
                 )
                 .withColumn(
-                    self._context.get_run_date_name,
+                    self._context.get_run_date_time_name,
                     lit(self._context.get_run_date),
                 )
             )
             error_df = df.filter(f"size(meta_{rule_type}_results) != 0")
             self._context.print_dataframe_with_debugger(error_df)
 
-            self.save_df_as_table(
-                error_df,
-                error_table,
-                self._context.get_target_and_error_table_writer_config,
+            print(
+                f"self._context.get_se_enable_error_table : {self._context.get_se_enable_error_table}"
             )
+            if self._context.get_se_enable_error_table:
+                self.save_df_as_table(
+                    error_df,
+                    error_table,
+                    self._context.get_target_and_error_table_writer_config,
+                )
 
             _error_count = error_df.count()
             if _error_count > 0:
-                self.generate_summarised_row_dq_res(error_df, rule_type)
+                self.generate_summarized_row_dq_res(error_df, rule_type)
 
             _log.info("_write_error_records_final ended")
             return _error_count, df
@@ -406,9 +440,9 @@ class SparkExpectationsWriter:
                 f"error occurred while saving data into the final error table {e}"
             )
 
-    def generate_summarised_row_dq_res(self, df: DataFrame, rule_type: str) -> None:
+    def generate_summarized_row_dq_res(self, df: DataFrame, rule_type: str) -> None:
         """
-        This function implements/supports summarising row dq error result
+        This function implements/supports summarizing row dq error result
         Args:
             df: error dataframe(DataFrame)
             rule_type: type of the rule(str)
@@ -418,40 +452,70 @@ class SparkExpectationsWriter:
 
         """
         try:
-
-            def update_dict(accumulator: dict) -> dict:  # pragma: no cover
-                if accumulator.get("failed_row_count") is None:  # pragma: no cover
-                    accumulator["failed_row_count"] = str(2)  # pragma: no cover
-                else:  # pragma: no cover
-                    accumulator["failed_row_count"] = str(  # pragma: no cover
-                        int(accumulator["failed_row_count"]) + 1  # pragma: no cover
-                    )  # pragma: no cover
-
-                return accumulator  # pragma: no cover
-
-            summarised_row_dq_dict: Dict[str, Dict[str, str]] = (
-                df.select(explode(f"meta_{rule_type}_results").alias("row_dq_res"))
-                .rdd.map(
-                    lambda rule_meta_dict: (
-                        rule_meta_dict[0]["rule"],
-                        {**rule_meta_dict[0], "failed_row_count": 1},
-                    )
-                )
-                .reduceByKey(lambda acc, itr: update_dict(acc))
-            ).collectAsMap()
-
-            self._context.set_summarised_row_dq_res(
-                list(summarised_row_dq_dict.values())
+            df_explode = df.select(
+                explode(f"meta_{rule_type}_results").alias("row_dq_res")
             )
+            df_res = (
+                df_explode.withColumn("rule_type", col("row_dq_res")["rule_type"])
+                .withColumn("rule", col("row_dq_res")["rule"])
+                .withColumn("description", col("row_dq_res")["description"])
+                .withColumn("tag", col("row_dq_res")["tag"])
+                .withColumn("action_if_failed", col("row_dq_res")["action_if_failed"])
+                .select("rule_type", "rule", "description", "tag", "action_if_failed")
+                .groupBy("rule_type", "rule", "description", "tag", "action_if_failed")
+                .count()
+                .withColumnRenamed("count", "failed_row_count")
+            )
+            summarized_row_dq_list = [
+                {
+                    "rule_type": row.rule_type,
+                    "rule": row.rule,
+                    "description": row.description,
+                    "tag": row.tag,
+                    "action_if_failed": row.action_if_failed,
+                    "failed_row_count": row.failed_row_count,
+                }
+                for row in df_res.select(
+                    "rule_type",
+                    "rule",
+                    "description",
+                    "tag",
+                    "action_if_failed",
+                    "failed_row_count",
+                ).collect()
+            ]
+            failed_rule_list = []
+            for failed_rule in summarized_row_dq_list:
+                failed_rule_list.append(failed_rule["rule"])
+
+            for (
+                each_rule_type,
+                all_rule_type_rules,
+            ) in self._context.get_dq_expectations.items():
+                if each_rule_type in ["row_dq_rules"]:
+                    for each_rule in all_rule_type_rules:
+                        if each_rule["rule"] not in failed_rule_list:
+                            summarized_row_dq_list.append(
+                                {
+                                    "description": each_rule["description"],
+                                    "tag": each_rule["tag"],
+                                    "rule": each_rule["rule"],
+                                    "action_if_failed": each_rule["action_if_failed"],
+                                    "rule_type": each_rule["rule_type"],
+                                    "failed_row_count": 0,
+                                }
+                            )
+
+            self._context.set_summarized_row_dq_res(summarized_row_dq_list)
 
         except Exception as e:
             raise SparkExpectationsMiscException(
-                f"error occurred created summarised row dq statistics {e}"
+                f"error occurred created summarized row dq statistics {e}"
             )
 
     def generate_rules_exceeds_threshold(self, rules: dict) -> None:
         """
-        This function implements/supports summarising row dq error threshold
+        This function implements/supports summarizing row dq error threshold
         Args:
             rules: accepts rule metadata within dict
         Returns:
@@ -460,12 +524,12 @@ class SparkExpectationsWriter:
         try:
             error_threshold_list = []
             rules_failed_row_count: Dict[str, int] = {}
-            if self._context.get_summarised_row_dq_res is None:
+            if self._context.get_summarized_row_dq_res is None:
                 return None
 
             rules_failed_row_count = {
                 itr["rule"]: int(itr["failed_row_count"])
-                for itr in self._context.get_summarised_row_dq_res
+                for itr in self._context.get_summarized_row_dq_res
             }
 
             for rule in rules[f"{self._context.get_row_dq_rule_type_name}_rules"]:

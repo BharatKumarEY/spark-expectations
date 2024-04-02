@@ -29,7 +29,7 @@ builder = (
 spark = builder.getOrCreate()
 ```
 
-Below is the configuration that can be used to run SparkExpectations and write to DeltaLake
+Below is the configuration that can be used to run SparkExpectations and write to Delta Lake
 
 ```python title="iceberg_write"
 import os
@@ -67,6 +67,8 @@ user_conf = {
     # user_config.se_notifications_on_fail: True,
     # user_config.se_notifications_on_error_drop_exceeds_threshold_breach: True,
     # user_config.se_notifications_on_error_drop_threshold: 15,
+    # user_config.se_enable_error_table: True,
+    # user_config.se_dq_rules_params: { "env": "local", "table": "product", },
 }
 
 
